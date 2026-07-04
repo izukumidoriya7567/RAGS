@@ -45,6 +45,7 @@ def submitAndWait(docPath:str|None=None, pollSeconds:int=5)-> str:
             print("Still processing... checking again in", pollSeconds, "s")
         time.sleep(pollSeconds)
 
+    return docId
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +53,9 @@ def submitAndWait(docPath:str|None=None, pollSeconds:int=5)-> str:
 # ---------------------------------------------------------------------------
 
 def useBuiltInChat(docId:str, question:str)-> str:
+    if docId is None:
+        raise ValueError("docId must be provided.")
+    
     response = pageIndexClient.chat_completions(
         doc_id=docId,
         messages=[{"role": "user", "content": question}],
@@ -98,12 +102,15 @@ def call_llm(prompt: str, model: str = "llama-3.3-70b-versatile") -> str:
     return response.content
 
 
-def custom_pipeline(doc_id: str, question: str) -> str:
+def custom_pipeline(docId: str, question: str) -> str:
+    if docId is None:
+        raise ValueError("docId must be provided.")
+    
     # Step 1: pull the hierarchical tree (titles + summaries + node ids)
-    tree_result = pageIndexClient.get_tree(doc_id)
-    tree = tree_result["result"]
-    flat_nodes = flattenTree(tree)
-    outline = buildSummaryOutline(flat_nodes)
+    treeResult=pageIndexClient.get_tree(docId)
+    tree=treeResult["result"]
+    flatNodes = flattenTree(tree)
+    outline = buildSummaryOutline(flatNodes)
 
     # Step 2: ask the LLM which node(s) are likely to contain the answer,
     # using ONLY titles/summaries (cheap, no full text yet)
@@ -117,25 +124,25 @@ Outline:
 
 Return ONLY a JSON list of the node_id values most likely to contain the
 answer, e.g. ["0003", "0007"]. Pick as few as needed, but don't miss relevant ones."""
-
-    raw_selection = call_llm(selection_prompt)
+    
+    rawSelectedIds = call_llm(selection_prompt)
     try:
-        selected_ids = json.loads(raw_selection)
+        selected_ids = json.loads(rawSelectedIds)
     except json.JSONDecodeError:
         # model may wrap in prose/backticks despite instructions; do a light cleanup
-        cleaned = raw_selection.strip().strip("`").strip()
+        cleaned = rawSelectedIds.strip().strip("`").strip()
         selected_ids = json.loads(cleaned)
 
-    # Step 3: pull full text only for the selected nodes
-    id_to_node = {(n.get("node_id") or n.get("id")): n for n in flat_nodes}
-    selected_texts = []
-    for nid in selected_ids:
-        node = id_to_node.get(nid)
+    idNodeMapping = {(n.get("node_id") or n.get("id")): n for n in flatNodes}
+
+    selectedTexts = []
+    for nodeId in selected_ids:
+        node=idNodeMapping.get(nodeId)
         if node:
             text = node.get("text") or node.get("content") or ""
-            selected_texts.append(f"### {node.get('title', nid)}\n{text}")
+            selectedTexts.append(f"### {node.get("title", nodeId)}\n{text}")
 
-    context = "\n\n".join(selected_texts)
+    context = "\n\n".join(selectedTexts)
 
     # Step 4: generate the grounded answer using only the retrieved context
     answer_prompt = f"""Answer the question using ONLY the context below.
@@ -149,12 +156,12 @@ Question: {question}"""
     return call_llm(answer_prompt)
 
 if __name__ == "__main__":
-    doc_id = submitAndWait(DOC_PATH)
+    docId = submitAndWait(DOC_PATH)
 
     question = "What is the main topic of the document?"
 
-    print("\n--- Mode A: built-in PageIndex chat_completions ---")
-    print(useBuiltInChat(doc_id, question))
+    # print("\n--- Mode A: built-in PageIndex chat_completions ---")
+    # print(useBuiltInChat(docId, question))
 
     print("\n--- Mode B: custom tree-reasoning pipeline ---")
-    print(custom_pipeline(doc_id, question))
+    print(custom_pipeline(docId, question))
