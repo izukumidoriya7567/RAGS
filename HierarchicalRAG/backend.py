@@ -34,7 +34,6 @@ CROSS_ENCODER_NAME = os.getenv("CROSS_ENCODER_MODEL","cross-encoder/ms-marco-Min
 SLM_MODEL = os.getenv("SLM_MODEL","llama-3.1-8b-instant")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
-
 slm = ChatGroq(
     model=SLM_MODEL,
     temperature=0,
@@ -51,17 +50,40 @@ qdrant = QdrantClient(
     api_key=QDRANT_API_KEY,
     timeout=60
 )
-class RAGState(TypedDict):
-    query_type: str
-    original_query: str
-    rewritten_query: str # the query after rewriting it by SLM
-    sub_queries: List[str] # when the query is complex, it can be broken down into multiple sub-queries 
 
-def build_graph():
-    graph = StateGraph()
+def hybrid_search(query:str, top_k:int=5, sparse_weight:float=0.5, dense_weight:float=0.5):
+    """
+    Perform a hybrid search using both sparse and dense embeddings.
 
-    graph.add
-def rerank(query:str , chunks:List[dict], top_k_chunks:int=3) ->List[dict]:
-    if not chunks or not query:
-        return []
+    Args:
+        query (str): Query provided by the user.
+        top_k (int): The number of top chunks to be fetched from the DB, according to the semantic and sparse search for BM_25 and Dense.
+        sparse_weight (float): The weight for the sparse search results, to be used for generating the final score according to which the results are gonna be ranked.
+        dense_weight (float): The weight for the dense search results, to be used for generating the final score according to which the results are gonna be ranked.
+    """
+    dense_vector = dense_model.encode(query, normalize_embeddings=True).tolist()
+    # It normalizes the embeddings because it speeds up the calculation of the cosine similarity, because it doesn't have to do anything with magnitude of vectors
+    sparse_emb = next(iter(sparse_model.embed([query])))
+    sparse_vector = models.SparseVector(
+        indices=sparse_emb.indices.tolist(),
+        values=sparse_emb.values.to_list()
+    )
+    query_results = qdrant.query_points(
+        collection_name=COLLECTION_NAME,
+        prefetch=[
+            models.Prefetch(query=dense_vector, using=DENSE_VECTOR_NAME, limit=10),
+            models.Prefetch(query=sparse_vector, using=SPARSE_VECTOR_NAME, limit=10)
+        ],
+        query=models.FusionQuery(fusion=models.Fusion.RRF),
+        limit=top_k,
+        with_payload=True
+    )
 
+    return [{
+            "text":p.payload["text"],
+            "parent_text":p.payload.get("parent_text",p.payload["text"]),
+            "source":p.payload.get("source","unknown"),
+            "score":p.score
+        }
+        for p in query_results.points
+    ]
