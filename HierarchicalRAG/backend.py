@@ -5,7 +5,7 @@ from typing import TypedDict, Optional, List, Literal, Annotated
 
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
-from fastembed import FastEmbed
+from fastembed import SparseTextEmbedding
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
@@ -19,6 +19,8 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 from fastembed import SparseTextEmbedding
 from typing import List
 
+load_dotenv()
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 CROSS_ENCODER_MODEL = os.getenv("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
@@ -29,10 +31,11 @@ COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "hierarchical_rag")
 DENSE_VECTOR_NAME = "dense"
 SPARSE_VECTOR_NAME = "sparse"
  
-DENSE_MODEL_NAME = os.getenv("DENSE_MODEL","")
+DENSE_MODEL_NAME = os.getenv("DENSE_MODEL","BAAI/bge-small-en-v1.5")
 SPARSE_MODEL_NAME = os.getenv("SPARSE_MODEL","")
 CROSS_ENCODER_NAME = os.getenv("CROSS_ENCODER_MODEL","cross-encoder/ms-marco-MiniLM-L-6-v2")
                              
+MAX_PARALLEL_WORKERS=10
 SLM_MODEL = os.getenv("SLM_MODEL","llama-3.1-8b-instant")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
@@ -58,7 +61,6 @@ sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL_NAME)
 cross_encoder = CrossEncoder(CROSS_ENCODER_NAME)
 
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60)
-
 
 def hybrid_search(query:str, top_k:int=5, sparse_weight:float=0.5, dense_weight:float=0.5):
     """
@@ -130,9 +132,6 @@ class RAGState(TypedDict):
     summaries: List[str]
     answer: Optional[str]
 
-# --------------------------------------------------------------------------- #
-# Graph nodes
-# --------------------------------------------------------------------------- #
 def classify_node(state: RAGState) -> dict:
     """SLM classifies the query as 'simple' or 'complex'."""
     prompt = ChatPromptTemplate.from_messages(
@@ -182,3 +181,102 @@ def retrieve_node(state:RAGState)-> dict:
     print(f"[retrieve] {len(chunks)} chunks")
 
     return {"rewritten_query":chunks}
+
+def decompose_node(state: RAGState) -> dict:
+    """COMPLEX path: SLM breaks the query into sub-queries."""
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "Decompose the user's complex question into 2-5 self-contained "
+                "sub-queries, each retrievable on its own. "
+                'Return ONLY a JSON array of strings, e.g. ["q1", "q2"]. No prose.',
+            ),
+            ("human", "{query}"),
+        ]
+    )
+    raw = (prompt | slm).invoke({"query": state["original_query"]}).content.strip()
+    try:
+        match = re.search(r"\[.*\]", raw, re.DOTALL)
+        sub_queries = json.loads(match.group(0)) if match else [state["original_query"]]
+        sub_queries = [q for q in sub_queries if isinstance(q, str) and q.strip()][:5]
+    except (json.JSONDecodeError, AttributeError):
+        sub_queries = [state["original_query"]]
+    if not sub_queries:
+        sub_queries = [state["original_query"]]
+    print(f"[decompose] {sub_queries}")
+    return {"sub_queries": sub_queries}
+
+
+def summarize_node(state: RAGState) -> dict:
+    """COMPLEX path: SLM summarizes retrieved chunks (grouped by sub-query)."""
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "Summarize the following retrieved passages into a dense, factual "
+                "summary that preserves all details relevant to the question. "
+                "No fluff, no preamble.",
+            ),
+            ("human", "Question: {question}\n\nPassages:\n{passages}"),
+        ]
+    )
+    chain = prompt | slm
+
+    groups: dict[str, List[dict]] = {}
+    for c in state["retrieved_chunks"]:
+        groups.setdefault(c.get("sub_query", "general"), []).append(c)
+
+    def summarize_group(item):
+        sub_q, chunks = item
+        passages = "\n\n---\n\n".join(c["parent_text"] for c in chunks)
+        summary = chain.invoke({"question": sub_q, "passages": passages}).content.strip()
+        return f"### Sub-question: {sub_q}\n{summary}"
+
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as pool:
+        summaries = list(pool.map(summarize_group, groups.items()))
+
+    print(f"[summarize] {len(summaries)} summaries")
+    return {"summaries": summaries}
+
+# done
+def parallel_retrieve_node(state: RAGState) -> dict:
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        results=list(pool.map(retrieve_and_rerank, state["sub_queries"]))
+
+    all_chunks, seen= [],set()
+
+    for sub_q, chunks in zip(state["sub_queries"],results):
+        for c in chunks:
+            key=c["parent_id"]
+            if key not in seen:
+                seen.add(key)
+                c["sub_query"]=sub_q
+                all_chunks.append(c)
+
+    print(f'"[parallel_retrieve]" {len(all_chunks)}')
+    return {"retrieved_chunks": all_chunks}
+
+def generate_node(state: RAGState) -> dict:
+    if state["query_type"]=='complex':
+        context="\n\n".join(state["summaries"])
+    else:
+        context="\n\n---\n\n".join(c["parent_text"] for c in state["retrieved_chunks"])
+
+    prompt= ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are a precise assistant. Answer the user's question using ONLY "
+                "the provided context. If the context is insufficient, say so. "
+                "Cite sources inline when useful.",
+            ),
+            ("human","Context:\n{context}\n\nQuestion: {question}"),
+        ]
+    )
+
+    answer= (prompt|llm).invoke({"context":context, "question":state["original_query"]}).content.strip()
+    return {
+        "answer":answer
+    }

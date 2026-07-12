@@ -1,8 +1,4 @@
 """
-backend_ai.py
-=============
-Query-time backend for the hierarchical Hybrid-Search RAG system.
-
 Flow (LangGraph):
 
                  ┌────────────────┐
@@ -57,9 +53,6 @@ from fastembed import SparseTextEmbedding
 
 load_dotenv()
 
-# --------------------------------------------------------------------------- #
-# Configuration (must match ingest_ai.py)
-# --------------------------------------------------------------------------- #
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "hierarchical_rag")
