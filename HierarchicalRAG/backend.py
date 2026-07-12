@@ -1,12 +1,10 @@
 import json
 import os
 import re
-import TypedDict
+from typing import TypedDict, Optional, List, Literal, Annotated
 
 from concurrent.futures import ThreadPoolExecutor
-
 from dotenv import load_dotenv
-
 from fastembed import FastEmbed
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -18,7 +16,7 @@ from operator import add
 from qdrant_client import QdrantClient, models
 
 from sentence_transformers import CrossEncoder, SentenceTransformer
-
+from fastembed import SparseTextEmbedding
 from typing import List
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -26,7 +24,11 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CROSS_ENCODER_MODEL = os.getenv("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "hierarchical_rag")
 
+DENSE_VECTOR_NAME = "dense"
+SPARSE_VECTOR_NAME = "sparse"
+ 
 DENSE_MODEL_NAME = os.getenv("DENSE_MODEL","")
 SPARSE_MODEL_NAME = os.getenv("SPARSE_MODEL","")
 CROSS_ENCODER_NAME = os.getenv("CROSS_ENCODER_MODEL","cross-encoder/ms-marco-MiniLM-L-6-v2")
@@ -50,6 +52,13 @@ qdrant = QdrantClient(
     api_key=QDRANT_API_KEY,
     timeout=60
 )
+
+dense_model = SentenceTransformer(DENSE_MODEL_NAME)
+sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL_NAME)
+cross_encoder = CrossEncoder(CROSS_ENCODER_NAME)
+
+qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60)
+
 
 def hybrid_search(query:str, top_k:int=5, sparse_weight:float=0.5, dense_weight:float=0.5):
     """
@@ -81,9 +90,95 @@ def hybrid_search(query:str, top_k:int=5, sparse_weight:float=0.5, dense_weight:
 
     return [{
             "text":p.payload["text"],
+            "parent_id":p.payload["parent_id"],
             "parent_text":p.payload.get("parent_text",p.payload["text"]),
             "source":p.payload.get("source","unknown"),
             "score":p.score
         }
         for p in query_results.points
     ]
+
+def rerank(query:str ,chunks:List[dict], top_k:int=5):
+
+    if not chunks or not query:
+        return []
+    
+    scores = cross_encoder.predict([(query, c["text"]) for c in chunks])
+
+    for c, s in zip(chunks, scores):
+        c["rerank_score"]=float(s)
+
+    ranked = sorted(chunks, key=lambda c:c["rerank_score"], reverse=True)[:top_k]
+
+    seen, unique = set(), []
+
+    for c in ranked:
+        key=c["parent_id"]
+        if key not in seen:
+           seen.add(key)
+           unique.add(key)
+
+def retrieve_and_rerank(query: str) -> List[dict]:
+    return rerank(query, hybrid_search(query))
+
+class RAGState(TypedDict):
+    original_query: str
+    query_type: Optional[Literal["simple", "complex"]]
+    rewritten_query: Optional[str]
+    sub_queries: List[str]
+    retrieved_chunks: Annotated[List[dict], add]
+    summaries: List[str]
+    answer: Optional[str]
+
+# --------------------------------------------------------------------------- #
+# Graph nodes
+# --------------------------------------------------------------------------- #
+def classify_node(state: RAGState) -> dict:
+    """SLM classifies the query as 'simple' or 'complex'."""
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You classify user queries for a RAG system.\n"
+                "A query is SIMPLE if it asks one focused thing answerable with a "
+                "single retrieval (a fact, definition, single how-to).\n"
+                "A query is COMPLEX if it is multi-part, comparative, requires "
+                "reasoning across multiple topics, or contains multiple questions.\n"
+                'Respond with ONLY one word: "simple" or "complex".',
+            ),
+            ("human", "{query}"),
+        ]
+    )
+    raw = (prompt | slm).invoke({"query": state["original_query"]}).content.strip().lower()
+    query_type = "complex" if "complex" in raw else "simple"
+    print(f"[classify] -> {query_type}")
+    return {"query_type": query_type}
+
+def route_by_type(state: RAGState)-> str:
+    return state["query_by_type"]
+
+def rewrite_node(state: RAGState) -> dict:
+    """SIMPLE path: SLM expands/rewrites the query for better retrieval."""
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "Rewrite the user's search query to maximize retrieval quality. "
+                "Expand abbreviations, add key synonyms, make implicit intent explicit. "
+                "Keep it a simple query. Output ONLY the rewritten query, nothing else.",
+            ),
+            ("human","{query}"),
+        ]
+    )
+
+    rewritten = (prompt|slm).invoke({"query":state["original_query"]}).content.strip()
+    print(f"[rewrite] {rewritten}")
+    return {"rewritten_query":rewritten}
+
+def retrieve_node(state:RAGState)-> dict:
+    query=state["rewritten_query"] or state["original_query"]
+    chunks = retrieve_and_rerank(query)
+
+    print(f"[retrieve] {len(chunks)} chunks")
+
+    return {"rewritten_query":chunks}
